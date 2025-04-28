@@ -1,5 +1,5 @@
 # uvvis_app
-The uvvis-app allows to evaluate concentrations of analytes in mixtures using multivaraite analysis. 
+The uvvis-app allows to evaluate concentrations of analytes in mixtures using Multivariate Partial Least Squares (PLS) analysis. 
 
 Works with Python 3.10.6!
 
