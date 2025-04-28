@@ -16,4 +16,4 @@ Works with Python 3.10.6!
 
    ```
    $ streamlit run uvvis_streamlit.py
-   `
+   ```
