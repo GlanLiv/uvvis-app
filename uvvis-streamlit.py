@@ -4,11 +4,12 @@ import numpy as np
 import re
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import cross_val_score, KFold
+from sklearn.metrics import mean_squared_error, make_scorer
 from bokeh.plotting import figure
 from bokeh.models import ColumnDataSource, Whisker
 from bokeh.palettes import Category10
 
-# ---------- Helper Functions ----------
+# -------------- Helper Functions -------------------
 
 def parse_spectrum(file):
     content = file.getvalue().decode('utf-8', errors='ignore').splitlines()
@@ -30,147 +31,230 @@ def parse_spectrum(file):
         df.sort_values(by="Wavelength", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
-    else:
-        return None
+    return None
 
-def plot_spectra(spectra, title, wl_min, wl_max):
-    p = figure(title=title, width=700, height=400, x_axis_label='Wavelength (nm)', y_axis_label='Absorbance')
+def plot_spectra(spectra, title, x_range=None):
+    p = figure(title=title, width=700, height=400, x_axis_label='Wavelength (nm)', y_axis_label='Absorbance', x_range=x_range)
     colors = Category10[10]
     for idx, (name, df) in enumerate(spectra.items()):
-        df_filtered = df[(df['Wavelength'] >= wl_min) & (df['Wavelength'] <= wl_max)]
-        source = ColumnDataSource(df_filtered)
-        p.line('Wavelength', 'Absorbance', source=source, legend_label=name, line_width=2, color=colors[idx % len(colors)])
+        source = ColumnDataSource(df)
+        clean_name = re.sub(r'\.csv|\.txt', '', name)
+        p.line('Wavelength', 'Absorbance', source=source, legend_label=clean_name, line_width=2, color=colors[idx % len(colors)])
     p.legend.click_policy = "hide"
     return p
 
-def calculate_sample_concentrations(stock_conc, volumes, total_volume):
-    return (stock_conc.values * volumes.values) / total_volume
+def calculate_sample_concentrations(stock_concentrations, volumes, total_volume):
+    concentrations = (stock_concentrations.values * volumes.values) / total_volume[:, np.newaxis]
+    return pd.DataFrame(concentrations, columns=stock_concentrations.index)
 
-def clean_filename(name):
-    return re.sub(r'\.csv$|\.txt$', '', name)
+def evaluate_pls_components(X, y, max_components):
+    mse = []
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    scorer = make_scorer(mean_squared_error, greater_is_better=False)
+    for n in range(1, max_components + 1):
+        pls = PLSRegression(n_components=n)
+        scores = cross_val_score(pls, X, y, cv=kf, scoring=scorer)
+        mse.append((-scores).mean())
+    return mse
 
-def plot_prediction_bars(pred_mean, pred_std, components):
-    p = figure(x_range=list(pred_mean.index), title="Konzentrationen mit Fehlerbalken", height=400, width=800)
-    colors = Category10[10]
-    for idx, comp in enumerate(components):
-        x = list(pred_mean.index)
-        y = pred_mean[comp].values
-        upper = y + pred_std[comp].fillna(0).values
-        lower = y - pred_std[comp].fillna(0).values
-
-        source = ColumnDataSource(data={"x": x, "y": y, "upper": upper, "lower": lower})
-        p.vbar(x='x', top='y', width=0.4, source=source, color=colors[idx % len(colors)], legend_label=comp)
-        p.add_layout(Whisker(source=source, base="x", upper="upper", lower="lower"))
-
-    p.xaxis.axis_label = "Proben"
-    p.yaxis.axis_label = "Konzentration (mg/mL)"
-    p.legend.click_policy = "hide"
+def plot_boxplot(pred_mean, pred_std, components_names):
+    p = figure(x_range=components_names, title="Vorhergesagte Konzentrationen mit Standardabweichung", width=700, height=400, y_axis_label="Konzentration (mg/mL)")
+    source = ColumnDataSource(data={
+        'component': components_names,
+        'mean': pred_mean.values.flatten(),
+        'upper': (pred_mean + pred_std).values.flatten(),
+        'lower': (pred_mean - pred_std).values.flatten()
+    })
+    p.vbar(x='component', top='mean', width=0.6, source=source)
+    whisker = Whisker(base='component', upper='upper', lower='lower', source=source)
+    whisker.upper_head.size = 10
+    whisker.lower_head.size = 10
+    p.add_layout(whisker)
     return p
 
-# ---------- Streamlit App ----------
+
+# -------------- Streamlit App -------------------
 
 st.set_page_config(page_title="UV-Vis PLS Analyse", layout="wide")
-
 st.title("UV-Vis Spektralanalyse mit PLS")
+st.info("Trainiere ein Modell zur Vorhersage von Konzentrationen basierend auf UV-Vis Spektren.")
 
-# Sidebar Inputs
+# --- Sidebar Inputs ---
 st.sidebar.header("Einstellungen")
-num_components = st.sidebar.number_input("Anzahl chemischer Komponenten", min_value=1, max_value=10, value=3)
-pls_components = st.sidebar.number_input("Anzahl PLS-Komponenten", min_value=1, max_value=num_components, value=num_components - 1)
-wl_range = st.sidebar.slider("Spektralbereich (nm)", 200, 800, (400, 700))
+
+num_chem_components = st.sidebar.number_input("Anzahl chemischer Komponenten", min_value=1, max_value=10, value=3)
+
+wavelength_min, wavelength_max = st.sidebar.slider("Spektralbereich (nm)", 200, 800, (200, 800))
+
+pls_components = st.sidebar.number_input("Anzahl PLS-Komponenten (max 7)", min_value=1, max_value=7, value=3)
 
 uploaded_train_files = st.sidebar.file_uploader("Trainingsspektren hochladen", accept_multiple_files=True, type=['csv', 'txt'])
-uploaded_measurement_files = st.sidebar.file_uploader("Messspektren hochladen", accept_multiple_files=True, type=['csv', 'txt'])
 
-eval_button = st.sidebar.button("PLS-Komponenten evaluieren")
+uploaded_measurement_files = st.sidebar.file_uploader("Messspektren (Triplikate) hochladen", accept_multiple_files=True, type=['csv', 'txt'])
+
 train_button = st.sidebar.button("Modell trainieren")
+evaluate_button = st.sidebar.button("PLS evaluieren")
 analyze_button = st.sidebar.button("Messung analysieren")
 
-# Daten einlesen
+# --- Stammlösungskonzentrationen ---
+default_stock_df = pd.DataFrame({
+    "Komponente": [f"Komponente {i+1}" for i in range(num_chem_components)],
+    "Konzentration (mg/mL)": [1.0]*num_chem_components
+})
+stock_conc_df = st.data_editor(default_stock_df, key="stock_conc_df", num_rows="fixed")
+
+# --- Mischverhältnisse ---
+mixing_columns = list(stock_conc_df["Komponente"]) + ["Solvens"]
+
+if uploaded_train_files:
+    sample_names = [file.name for file in uploaded_train_files]
+    default_mixing_df = pd.DataFrame(0.0, index=sample_names, columns=mixing_columns)
+    mixing_df = st.data_editor(default_mixing_df, key="mixing_df")
+else:
+    st.info("Bitte lade Trainingsspektren hoch, um Mischverhältnisse zu definieren.")
+    mixing_df = pd.DataFrame()
+
+x_range = (wavelength_min, wavelength_max)
+
+# --- Trainingsspektren einlesen ---
 train_spectra = {}
+if uploaded_train_files:
+    for file in uploaded_train_files:
+        df = parse_spectrum(file)
+        if df is not None:
+            train_spectra[file.name] = df
+        else:
+            st.warning(f"{file.name} konnte nicht gelesen werden.")
+
+# --- Messspektren einlesen ---
 measurement_spectra = {}
+if uploaded_measurement_files:
+    for file in uploaded_measurement_files:
+        df = parse_spectrum(file)
+        if df is not None:
+            measurement_spectra[file.name] = df
+        else:
+            st.warning(f"{file.name} konnte nicht gelesen werden.")
 
-for file in uploaded_train_files:
-    df = parse_spectrum(file)
-    if df is not None:
-        train_spectra[clean_filename(file.name)] = df
-
-for file in uploaded_measurement_files:
-    df = parse_spectrum(file)
-    if df is not None:
-        measurement_spectra[clean_filename(file.name)] = df
-
+# --- Trainingsspektren plotten ---
 if train_spectra:
     st.subheader("Trainingsspektren")
-    st.bokeh_chart(plot_spectra(train_spectra, "Trainingsspektren", *wl_range), use_container_width=True)
+    st.bokeh_chart(plot_spectra(train_spectra, "Trainingsspektren", x_range=x_range), use_container_width=True)
 
-    components = [f"Komponente {i+1}" for i in range(num_components)]
-    st.subheader("Stammlösungs-Konzentrationen (mg/mL)")
-
-    stock_conc_df = pd.DataFrame({"Komponente": components, "Konzentration (mg/mL)": [1.0]*num_components})
-    stock_conc_df = st.data_editor(stock_conc_df, num_rows="fixed", key="stock_conc")
-    stock_conc_series = pd.Series(stock_conc_df["Konzentration (mg/mL)"].values, index=components)
-
-    st.subheader("Mischverhältnisse (Volumen in mL)")
-    mixing_columns = components + ["Wasser"]
-    sample_names = list(train_spectra.keys())
-
-    if "mixing_df" not in st.session_state:
-        st.session_state.mixing_df = pd.DataFrame(0.0, index=sample_names, columns=mixing_columns)
+# --- Modell Training ---
+if train_button:
+    if not train_spectra:
+        st.error("Bitte lade Trainingsspektren hoch!")
+    elif mixing_df.empty:
+        st.error("Bitte gib Mischverhältnisse ein!")
     else:
-        existing = st.session_state.mixing_df
-        st.session_state.mixing_df = pd.DataFrame(0.0, index=sample_names, columns=mixing_columns)
-        for sample in sample_names:
-            if sample in existing.index:
-                st.session_state.mixing_df.loc[sample] = existing.loc[sample]
+        try:
+            st.subheader("Modell Training...")
+            wavelengths = np.linspace(wavelength_min, wavelength_max, num=601)
+            X_train = np.array([
+                np.interp(wavelengths, df["Wavelength"], df["Absorbance"]) for df in train_spectra.values()
+            ])
+            chem_components = list(stock_conc_df["Komponente"])
+            stock_conc_series = pd.Series(stock_conc_df["Konzentration (mg/mL)"].values, index=chem_components)
+            volumes_only = mixing_df[chem_components]
+            total_volumes = volumes_only.sum(axis=1).values + mixing_df["Solvens"].values
+            if not np.allclose(total_volumes, total_volumes[0], atol=0.01):
+                st.error("Gesamtvolumen der Mischungen ist nicht konstant!")
+            else:
+                y_train = calculate_sample_concentrations(stock_conc_series, volumes_only, total_volumes)
+                pls = PLSRegression(n_components=pls_components)
+                pls.fit(X_train, y_train)
+                st.success("Modell erfolgreich trainiert!")
+                # Speichere für Analyse
+                st.session_state["pls_model"] = pls
+                st.session_state["wavelengths"] = wavelengths
+        except Exception as e:
+            st.error(f"Fehler beim Training: {e}")
 
-    mixing_df = st.data_editor(st.session_state.mixing_df, key="mixing_volumes")
+# --- PLS Evaluation ---
+if evaluate_button:
+    if not train_spectra:
+        st.error("Bitte lade Trainingsspektren hoch!")
+    elif mixing_df.empty:
+        st.error("Bitte gib Mischverhältnisse ein!")
+    else:
+        try:
+            st.subheader("PLS Komponenten Evaluation (MSE)")
+            wavelengths = np.linspace(wavelength_min, wavelength_max, num=601)
+            X_train = np.array([
+                np.interp(wavelengths, df["Wavelength"], df["Absorbance"]) for df in train_spectra.values()
+            ])
+            chem_components = list(stock_conc_df["Komponente"])
+            stock_conc_series = pd.Series(stock_conc_df["Konzentration (mg/mL)"].values, index=chem_components)
+            volumes_only = mixing_df[chem_components]
+            total_volumes = volumes_only.sum(axis=1).values + mixing_df["Solvens"].values
+            if not np.allclose(total_volumes, total_volumes[0], atol=0.01):
+                st.error("Gesamtvolumen der Mischungen ist nicht konstant!")
+            else:
+                y_train = calculate_sample_concentrations(stock_conc_series, volumes_only, total_volumes)
+                max_pls_eval = 7
+                mse = evaluate_pls_components(X_train, y_train, max_pls_eval)
+                df_mse = pd.DataFrame({"PLS-Komponenten": list(range(1, max_pls_eval+1)), "MSE": mse})
+                st.line_chart(df_mse.set_index("PLS-Komponenten"))
+        except Exception as e:
+            st.error(f"Fehler bei der PLS Evaluation: {e}")
 
-# PLS Komponenten evaluieren
-if eval_button and train_spectra:
-    wavelengths = np.linspace(*wl_range[::-1], num=601)
-    X = np.array([np.interp(wavelengths, df['Wavelength'], df['Absorbance']) for df in train_spectra.values()])
-    y = calculate_sample_concentrations(stock_conc_series, mixing_df[components], mixing_df.sum(axis=1).values[:, np.newaxis])
+# --- Analyse Messspektren ---
+if analyze_button:
+    pls = st.session_state.get("pls_model", None)
+    wavelengths = st.session_state.get("wavelengths", None)
+    if pls is None or wavelengths is None:
+        st.error("Bitte trainiere zuerst ein Modell!")
+    elif not measurement_spectra:
+        st.error("Bitte lade Messspektren hoch!")
+    else:
+        try:
+            # Interpolation der Messdaten
+            filenames = list(measurement_spectra.keys())
+            X_measure = np.array([
+                np.interp(wavelengths, df["Wavelength"], df["Absorbance"]) for df in measurement_spectra.values()
+            ])
 
-    scores = []
-    for n in range(1, min(num_components + 1, len(train_spectra))):
-        model = PLSRegression(n_components=n)
-        cv = KFold(n_splits=min(5, len(train_spectra)), shuffle=True, random_state=1)
-        mse = -cross_val_score(model, X, y, cv=cv, scoring='neg_mean_squared_error').mean()
-        scores.append(mse)
+            # Vorhersage mit PLS-Modell
+            y_pred = pls.predict(X_measure)
+            chem_components = list(stock_conc_df["Komponente"])
+            pred_df = pd.DataFrame(y_pred, columns=chem_components, index=filenames)
 
-    st.line_chart(pd.DataFrame(scores, index=range(1, len(scores)+1), columns=['MSE']))
+            # Berechnung von Mittelwert & empirischer Standardabweichung
+            mean_row = pred_df.mean(axis=0)
+            std_row = pred_df.std(axis=0, ddof=1)
 
-# Modell trainieren
-if train_button and train_spectra:
-    wavelengths = np.linspace(*wl_range[::-1], num=601)
-    X_train = np.array([np.interp(wavelengths, df['Wavelength'], df['Absorbance']) for df in train_spectra.values()])
-    y_train = calculate_sample_concentrations(stock_conc_series, mixing_df[components], mixing_df.sum(axis=1).values[:, np.newaxis])
+            # Tabelle mit Ergebnissen anzeigen
+            result_df = pred_df.copy()
+            result_df.loc["Standardabweichung"] = std_row
+            result_df.loc["Mittelwert"] = mean_row
 
-    pls = PLSRegression(n_components=pls_components)
-    pls.fit(X_train, y_train)
-    st.session_state["pls_model"] = pls
-    st.session_state["wavelengths"] = wavelengths
-    st.success("Modell erfolgreich trainiert!")
+            st.subheader("Vorhergesagte Konzentrationen mit Mittelwert & Standardabweichung")
+            st.dataframe(result_df)
 
-# Analyse
-if analyze_button and "pls_model" in st.session_state and measurement_spectra:
-    wavelengths = st.session_state["wavelengths"]
-    pls = st.session_state["pls_model"]
+            # ---------- BALKENDIAGRAMM MIT FEHLERBALKEN ----------
+            from bokeh.plotting import figure
+            from bokeh.models import ColumnDataSource, Whisker
 
-    X_measure = np.array([np.interp(wavelengths, df['Wavelength'], df['Absorbance']) for df in measurement_spectra.values()])
-    y_pred = pls.predict(X_measure)
+            p = figure(title="Mittelwert & Standardabweichung je Komponente",
+                       x_range=chem_components,
+                       width=700, height=400,
+                       y_axis_label="Konzentration (mg/mL)")
 
-    st.subheader("Messspektren")
-    st.bokeh_chart(plot_spectra(measurement_spectra, "Messspektren", *wl_range), use_container_width=True)
+            source = ColumnDataSource(data=dict(
+                component=chem_components,
+                mean=mean_row.values,
+                upper=(mean_row + std_row).values,
+                lower=(mean_row - std_row).values
+            ))
 
-    pred_df = pd.DataFrame(y_pred, columns=components, index=list(measurement_spectra.keys()))
-    pred_mean = pred_df.groupby(pred_df.index).mean()
-    pred_std = pred_df.groupby(pred_df.index).std()
+            p.vbar(x='component', top='mean', width=0.6, source=source, color="steelblue")
+            whisker = Whisker(base='component', upper='upper', lower='lower', source=source)
+            whisker.upper_head.size = 10
+            whisker.lower_head.size = 10
+            p.add_layout(whisker)
 
-    st.subheader("Vorhergesagte Konzentrationen (mg/mL)")
-    st.write("Mittelwert (Triplikate):")
-    st.dataframe(pred_mean)
-    st.write("Standardabweichung:")
-    st.dataframe(pred_std)
-    st.bokeh_chart(plot_prediction_bars(pred_mean, pred_std, components), use_container_width=True)
+            st.bokeh_chart(p, use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Fehler bei der Analyse: {e}")
