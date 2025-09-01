@@ -3,6 +3,8 @@ The uvvis-app allows to evaluate concentrations of analytes in mixtures using Mu
 
 Works with Python 3.10.6!
 
+Check it out: https://uvvis-app.streamlit.app/
+
 
 ### How to run it on your own machine
 
